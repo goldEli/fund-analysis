@@ -1,0 +1,4 @@
+*.xlsx
+.env
+.env.*
+__pycache__
