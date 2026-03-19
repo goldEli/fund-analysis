@@ -65,7 +65,9 @@ def ensure_tables(conn, schema: str) -> None:
                     fund_type TEXT,
                     return_1m DOUBLE PRECISION,
                     return_3m DOUBLE PRECISION,
+                    return_6m DOUBLE PRECISION,
                     return_1y DOUBLE PRECISION,
+                    return_ytd DOUBLE PRECISION,
                     peer_avg_return_1m DOUBLE PRECISION,
                     peer_avg_return_3m DOUBLE PRECISION,
                     peer_avg_return_1y DOUBLE PRECISION,
@@ -75,6 +77,11 @@ def ensure_tables(conn, schema: str) -> None:
                     peer_count_1m INTEGER,
                     peer_count_3m INTEGER,
                     peer_count_1y INTEGER,
+                    rank_percentile_1m DOUBLE PRECISION,
+                    rank_percentile_3m DOUBLE PRECISION,
+                    rank_percentile_1y DOUBLE PRECISION,
+                    inception_date DATE,
+                    fund_scale DOUBLE PRECISION,
                     peer_rank_1m_display TEXT,
                     peer_rank_3m_display TEXT,
                     peer_rank_1y_display TEXT,
@@ -86,7 +93,9 @@ def ensure_tables(conn, schema: str) -> None:
         for ddl in (
             "ALTER TABLE {}.fund_basic ADD COLUMN IF NOT EXISTS return_1m DOUBLE PRECISION",
             "ALTER TABLE {}.fund_basic ADD COLUMN IF NOT EXISTS return_3m DOUBLE PRECISION",
+            "ALTER TABLE {}.fund_basic ADD COLUMN IF NOT EXISTS return_6m DOUBLE PRECISION",
             "ALTER TABLE {}.fund_basic ADD COLUMN IF NOT EXISTS return_1y DOUBLE PRECISION",
+            "ALTER TABLE {}.fund_basic ADD COLUMN IF NOT EXISTS return_ytd DOUBLE PRECISION",
             "ALTER TABLE {}.fund_basic ADD COLUMN IF NOT EXISTS peer_avg_return_1m DOUBLE PRECISION",
             "ALTER TABLE {}.fund_basic ADD COLUMN IF NOT EXISTS peer_avg_return_3m DOUBLE PRECISION",
             "ALTER TABLE {}.fund_basic ADD COLUMN IF NOT EXISTS peer_avg_return_1y DOUBLE PRECISION",
@@ -96,6 +105,11 @@ def ensure_tables(conn, schema: str) -> None:
             "ALTER TABLE {}.fund_basic ADD COLUMN IF NOT EXISTS peer_count_1m INTEGER",
             "ALTER TABLE {}.fund_basic ADD COLUMN IF NOT EXISTS peer_count_3m INTEGER",
             "ALTER TABLE {}.fund_basic ADD COLUMN IF NOT EXISTS peer_count_1y INTEGER",
+            "ALTER TABLE {}.fund_basic ADD COLUMN IF NOT EXISTS rank_percentile_1m DOUBLE PRECISION",
+            "ALTER TABLE {}.fund_basic ADD COLUMN IF NOT EXISTS rank_percentile_3m DOUBLE PRECISION",
+            "ALTER TABLE {}.fund_basic ADD COLUMN IF NOT EXISTS rank_percentile_1y DOUBLE PRECISION",
+            "ALTER TABLE {}.fund_basic ADD COLUMN IF NOT EXISTS inception_date DATE",
+            "ALTER TABLE {}.fund_basic ADD COLUMN IF NOT EXISTS fund_scale DOUBLE PRECISION",
             "ALTER TABLE {}.fund_basic ADD COLUMN IF NOT EXISTS peer_rank_1m_display TEXT",
             "ALTER TABLE {}.fund_basic ADD COLUMN IF NOT EXISTS peer_rank_3m_display TEXT",
             "ALTER TABLE {}.fund_basic ADD COLUMN IF NOT EXISTS peer_rank_1y_display TEXT",
@@ -194,6 +208,17 @@ def fetch_fund_exchange_rank():
     return ak.fund_exchange_rank_em()
 
 
+def fetch_fund_scale_open(symbol: str):
+    try:
+        import akshare as ak  # type: ignore
+    except ModuleNotFoundError:
+        print("Missing dependency: akshare", file=sys.stderr)
+        print("Install: python -m pip install -r script/requirements.txt", file=sys.stderr)
+        raise
+
+    return ak.fund_scale_open_sina(symbol=symbol)
+
+
 def to_int(value) -> Optional[int]:
     if value is None:
         return None
@@ -209,6 +234,12 @@ def format_rank_display(rank: Optional[int], count: Optional[int]) -> Optional[s
     if rank is None or count is None:
         return None
     return f"{rank}/{count}"
+
+
+def compute_rank_percentile(rank: Optional[int], count: Optional[int]) -> Optional[float]:
+    if rank is None or count is None or count <= 0:
+        return None
+    return rank / count
 
 
 def normalize_fund_name(value) -> str:
@@ -245,7 +276,7 @@ def prepare_rank_df(rank_df, source_name: str):
         ranked["基金代码"] = ranked["基金代码"].map(normalize_fund_code)
     if "基金简称" in ranked.columns:
         ranked["基金简称"] = ranked["基金简称"].map(normalize_fund_name)
-    for col in ("近1月", "近3月", "近1年"):
+    for col in ("近1月", "近3月", "近6月", "近1年", "今年来"):
         if col not in ranked.columns:
             ranked[col] = None
         ranked[col] = pd.to_numeric(ranked[col], errors="coerce")
@@ -295,14 +326,54 @@ def apply_rank_metrics(records: Dict[str, Dict[str, object]], ranked, source_nam
                 rec.get(f"peer_rank_{suffix}"),
                 rec.get(f"peer_count_{suffix}"),
             )
+            rec[f"rank_percentile_{suffix}"] = compute_rank_percentile(
+                rec.get(f"peer_rank_{suffix}"),
+                rec.get(f"peer_count_{suffix}"),
+            )
+            rec["return_6m"] = to_float(r.get("近6月"))
+            rec["return_ytd"] = to_float(r.get("今年来"))
     return matched_codes
+
+
+def build_scale_map(scale_dfs: Sequence[object]) -> Dict[str, Dict[str, object]]:
+    try:
+        import pandas as pd  # type: ignore
+    except ModuleNotFoundError:
+        print("Missing dependency: pandas", file=sys.stderr)
+        print("Install: python -m pip install -r script/requirements.txt", file=sys.stderr)
+        raise
+
+    out: Dict[str, Dict[str, object]] = {}
+    for df in scale_dfs:
+        if df is None or getattr(df, "empty", False):
+            continue
+        for _, r in df.iterrows():
+            code = normalize_fund_code(r.get("基金代码"))
+            if not code:
+                continue
+            rec = out.setdefault(code, {})
+            if rec.get("inception_date") is None:
+                d = r.get("成立日期")
+                if d is not None and not pd.isna(d):
+                    if isinstance(d, datetime):
+                        rec["inception_date"] = d.date()
+                    else:
+                        rec["inception_date"] = d
+            if rec.get("fund_scale") is None:
+                scale = to_float(r.get("最近总份额"))
+                if scale is None:
+                    scale = to_float(r.get("总募集规模"))
+                rec["fund_scale"] = scale
+    return out
 
 
 def fill_rank_metrics_by_name_alias(records: Dict[str, Dict[str, object]]) -> int:
     metrics = (
         "return_1m",
         "return_3m",
+        "return_6m",
         "return_1y",
+        "return_ytd",
         "peer_avg_return_1m",
         "peer_avg_return_3m",
         "peer_avg_return_1y",
@@ -312,6 +383,9 @@ def fill_rank_metrics_by_name_alias(records: Dict[str, Dict[str, object]]) -> in
         "peer_count_1m",
         "peer_count_3m",
         "peer_count_1y",
+        "rank_percentile_1m",
+        "rank_percentile_3m",
+        "rank_percentile_1y",
         "peer_rank_1m_display",
         "peer_rank_3m_display",
         "peer_rank_1y_display",
@@ -349,7 +423,7 @@ def fill_rank_metrics_by_name_alias(records: Dict[str, Dict[str, object]]) -> in
     return filled
 
 
-def build_basic_rows(fund_df, rank_dfs: Sequence[Tuple[str, object]]) -> List[Tuple[str, Optional[str], Optional[str], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[int], Optional[int], Optional[int], Optional[int], Optional[int], Optional[int], Optional[str], Optional[str], Optional[str]]]:
+def build_basic_rows(fund_df, rank_dfs: Sequence[Tuple[str, object]], scale_dfs: Sequence[object]) -> List[Tuple[str, Optional[str], Optional[str], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[int], Optional[int], Optional[int], Optional[int], Optional[int], Optional[int], Optional[float], Optional[float], Optional[float], Optional[date], Optional[float], Optional[str], Optional[str], Optional[str]]]:
     try:
         import pandas as pd  # type: ignore
     except ModuleNotFoundError:
@@ -368,7 +442,9 @@ def build_basic_rows(fund_df, rank_dfs: Sequence[Tuple[str, object]]) -> List[Tu
                 "fund_type": None if pd.isna(r.get("基金类型")) else str(r.get("基金类型")),
                 "return_1m": None,
                 "return_3m": None,
+                "return_6m": None,
                 "return_1y": None,
+                "return_ytd": None,
                 "peer_avg_return_1m": None,
                 "peer_avg_return_3m": None,
                 "peer_avg_return_1y": None,
@@ -378,6 +454,11 @@ def build_basic_rows(fund_df, rank_dfs: Sequence[Tuple[str, object]]) -> List[Tu
                 "peer_count_1m": None,
                 "peer_count_3m": None,
                 "peer_count_1y": None,
+                "rank_percentile_1m": None,
+                "rank_percentile_3m": None,
+                "rank_percentile_1y": None,
+                "inception_date": None,
+                "fund_scale": None,
                 "peer_rank_1m_display": None,
                 "peer_rank_3m_display": None,
                 "peer_rank_1y_display": None,
@@ -390,9 +471,21 @@ def build_basic_rows(fund_df, rank_dfs: Sequence[Tuple[str, object]]) -> List[Tu
         matched = apply_rank_metrics(records, ranked, source_name)
         source_stats.append((source_name, matched))
 
+    scale_map = build_scale_map(scale_dfs)
+    scale_filled = 0
+    for code, scale_rec in scale_map.items():
+        rec = records.get(code)
+        if rec is None:
+            continue
+        if rec.get("inception_date") is None and scale_rec.get("inception_date") is not None:
+            rec["inception_date"] = scale_rec.get("inception_date")
+            scale_filled += 1
+        if rec.get("fund_scale") is None and scale_rec.get("fund_scale") is not None:
+            rec["fund_scale"] = scale_rec.get("fund_scale")
+
     alias_filled = fill_rank_metrics_by_name_alias(records)
 
-    rows: List[Tuple[str, Optional[str], Optional[str], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[int], Optional[int], Optional[int], Optional[int], Optional[int], Optional[int], Optional[str], Optional[str], Optional[str]]] = []
+    rows: List[Tuple[str, Optional[str], Optional[str], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[int], Optional[int], Optional[int], Optional[int], Optional[int], Optional[int], Optional[float], Optional[float], Optional[float], Optional[date], Optional[float], Optional[str], Optional[str], Optional[str]]] = []
     for code, rec in records.items():
         rows.append(
             (
@@ -401,7 +494,9 @@ def build_basic_rows(fund_df, rank_dfs: Sequence[Tuple[str, object]]) -> List[Tu
                 rec.get("fund_type"),
                 rec.get("return_1m"),
                 rec.get("return_3m"),
+                rec.get("return_6m"),
                 rec.get("return_1y"),
+                rec.get("return_ytd"),
                 rec.get("peer_avg_return_1m"),
                 rec.get("peer_avg_return_3m"),
                 rec.get("peer_avg_return_1y"),
@@ -411,6 +506,11 @@ def build_basic_rows(fund_df, rank_dfs: Sequence[Tuple[str, object]]) -> List[Tu
                 rec.get("peer_count_1m"),
                 rec.get("peer_count_3m"),
                 rec.get("peer_count_1y"),
+                rec.get("rank_percentile_1m"),
+                rec.get("rank_percentile_3m"),
+                rec.get("rank_percentile_1y"),
+                rec.get("inception_date"),
+                rec.get("fund_scale"),
                 rec.get("peer_rank_1m_display"),
                 rec.get("peer_rank_3m_display"),
                 rec.get("peer_rank_1y_display"),
@@ -420,7 +520,7 @@ def build_basic_rows(fund_df, rank_dfs: Sequence[Tuple[str, object]]) -> List[Tu
     source_msg = ", ".join(f"{name}={count}" for name, count in source_stats)
     print(
         f"Prepared fund_basic rows: total={len(rows)}, with_return_metrics={matched}, "
-        f"sources[{source_msg}], alias_fill={alias_filled}"
+        f"sources[{source_msg}], alias_fill={alias_filled}, scale_fill={scale_filled}"
     )
     return rows
 
@@ -439,12 +539,19 @@ def upsert_fund_basic(
             Optional[float],
             Optional[float],
             Optional[float],
+            Optional[float],
+            Optional[float],
             Optional[int],
             Optional[int],
             Optional[int],
             Optional[int],
             Optional[int],
             Optional[int],
+            Optional[float],
+            Optional[float],
+            Optional[float],
+            Optional[date],
+            Optional[float],
             Optional[str],
             Optional[str],
             Optional[str],
@@ -461,7 +568,9 @@ def upsert_fund_basic(
             fund_type,
             return_1m,
             return_3m,
+            return_6m,
             return_1y,
+            return_ytd,
             peer_avg_return_1m,
             peer_avg_return_3m,
             peer_avg_return_1y,
@@ -471,6 +580,11 @@ def upsert_fund_basic(
             peer_count_1m,
             peer_count_3m,
             peer_count_1y,
+            rank_percentile_1m,
+            rank_percentile_3m,
+            rank_percentile_1y,
+            inception_date,
+            fund_scale,
             peer_rank_1m_display,
             peer_rank_3m_display,
             peer_rank_1y_display
@@ -481,7 +595,9 @@ def upsert_fund_basic(
             fund_type = EXCLUDED.fund_type,
             return_1m = EXCLUDED.return_1m,
             return_3m = EXCLUDED.return_3m,
+            return_6m = EXCLUDED.return_6m,
             return_1y = EXCLUDED.return_1y,
+            return_ytd = EXCLUDED.return_ytd,
             peer_avg_return_1m = EXCLUDED.peer_avg_return_1m,
             peer_avg_return_3m = EXCLUDED.peer_avg_return_3m,
             peer_avg_return_1y = EXCLUDED.peer_avg_return_1y,
@@ -491,6 +607,11 @@ def upsert_fund_basic(
             peer_count_1m = EXCLUDED.peer_count_1m,
             peer_count_3m = EXCLUDED.peer_count_3m,
             peer_count_1y = EXCLUDED.peer_count_1y,
+            rank_percentile_1m = EXCLUDED.rank_percentile_1m,
+            rank_percentile_3m = EXCLUDED.rank_percentile_3m,
+            rank_percentile_1y = EXCLUDED.rank_percentile_1y,
+            inception_date = EXCLUDED.inception_date,
+            fund_scale = EXCLUDED.fund_scale,
             peer_rank_1m_display = EXCLUDED.peer_rank_1m_display,
             peer_rank_3m_display = EXCLUDED.peer_rank_3m_display,
             peer_rank_1y_display = EXCLUDED.peer_rank_1y_display,
@@ -655,7 +776,14 @@ def main() -> int:
                 ("money", fetch_fund_money_rank()),
                 ("exchange", fetch_fund_exchange_rank()),
             ]
-            rows = build_basic_rows(df, rank_dfs)
+            scale_dfs = [
+                fetch_fund_scale_open("股票型基金"),
+                fetch_fund_scale_open("混合型基金"),
+                fetch_fund_scale_open("债券型基金"),
+                fetch_fund_scale_open("货币型基金"),
+                fetch_fund_scale_open("QDII基金"),
+            ]
+            rows = build_basic_rows(df, rank_dfs, scale_dfs)
             inserted = upsert_fund_basic(conn, args.schema, rows)
             print("Synced fund_basic:", inserted)
 
