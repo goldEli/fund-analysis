@@ -1,28 +1,20 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Inject } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Message } from './message.entity';
 import { ChatOpenAI } from '@langchain/openai';
 import { HumanMessage, AIMessage, SystemMessage } from '@langchain/core/messages';
-import { ConfigService } from '@nestjs/config';
+import { CHAT_MODEL_TOKEN } from './llm.provider';
+import { ToolOrchestratorService } from './tool-orchestrator.service';
 
 @Injectable()
 export class AgentService {
-  private chatModel: ChatOpenAI;
-
   constructor(
     @InjectRepository(Message)
     private messageRepository: Repository<Message>,
-    private configService: ConfigService,
-  ) {
-    const baseURL = this.configService.get<string>('OPENAI_BASE_URL');
-    this.chatModel = new ChatOpenAI({
-      apiKey: this.configService.get<string>('OPENAI_API_KEY'),
-      model: this.configService.get<string>('LLM_MODEL_NAME', 'gpt-4o-mini'),
-      streaming: true,
-      ...(baseURL ? { configuration: { baseURL } } : {}),
-    });
-  }
+    @Inject(CHAT_MODEL_TOKEN) private chatModel: ChatOpenAI,
+    private toolOrchestrator: ToolOrchestratorService,
+  ) {}
 
   async getChatHistory(): Promise<Message[]> {
     return this.messageRepository.find({
@@ -47,7 +39,9 @@ export class AgentService {
       return new SystemMessage(m.content);
     });
 
-    const stream = await this.chatModel.stream(langchainMessages);
+    const workingMessages = await this.toolOrchestrator.runToolLoop(langchainMessages);
+
+    const stream = await this.chatModel.stream(workingMessages);
 
     // We will use an async generator to yield chunks and then save the final message
     async function* generateStream(this: AgentService) {
