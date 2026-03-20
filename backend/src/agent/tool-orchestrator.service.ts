@@ -1,5 +1,9 @@
 import { Injectable, Inject } from '@nestjs/common';
-import { BaseMessage, SystemMessage, ToolMessage } from '@langchain/core/messages';
+import {
+  BaseMessage,
+  SystemMessage,
+  ToolMessage,
+} from '@langchain/core/messages';
 import { ChatOpenAI } from '@langchain/openai';
 import { DynamicTool } from '@langchain/core/tools';
 import { PLANNER_MODEL_TOKEN } from './llm.provider';
@@ -9,14 +13,14 @@ import { WEB_SEARCH_TOOL_TOKEN } from './web-search-tool.provider';
 export class ToolOrchestratorService {
   constructor(
     @Inject(PLANNER_MODEL_TOKEN) private plannerModel: ChatOpenAI,
-    @Inject(WEB_SEARCH_TOOL_TOKEN) private webSearchTool: DynamicTool,
+    @Inject('bocha_web_search') private webSearchTool: any,
   ) {}
 
   async runToolLoop(langchainMessages: BaseMessage[]): Promise<BaseMessage[]> {
     const tools = [this.webSearchTool];
 
     const toolPrompt = new SystemMessage(
-      'You may use the bocha_web_search tool to search the internet for sources and URLs when needed. Prefer using it when answering questions that require external facts or citations.',
+      'You may use the web_search tool to search the internet for sources and URLs when needed. Prefer using it when answering questions that require external facts or citations.',
     );
 
     const workingMessages: BaseMessage[] = [toolPrompt, ...langchainMessages];
@@ -25,48 +29,48 @@ export class ToolOrchestratorService {
       ? (this.plannerModel as any).bindTools(tools)
       : this.plannerModel;
 
-    for (let i = 0; i < 3; i++) {
+    while (true) {
       const ai = await plannerWithTools.invoke(workingMessages);
       workingMessages.push(ai);
 
       const toolCalls: any[] =
-        (ai as any).tool_calls ?? (ai as any).additional_kwargs?.tool_calls ?? [];
+        (ai as any).tool_calls ??
+        (ai as any).additional_kwargs?.tool_calls ??
+        [];
+
+      console.log('toolCalls', toolCalls);
 
       if (!Array.isArray(toolCalls) || toolCalls.length === 0) break;
 
       for (const call of toolCalls) {
         const name = call?.name ?? call?.function?.name;
-        console.log("tool name", name)
-        const rawArgs = call?.args ?? call?.function?.arguments ?? {};
+        // const rawArgs = call?.args ?? call?.function?.arguments ?? {};
         const id = call?.id ?? call?.tool_call_id;
 
-        const tool = tools.find((t) => t.name === name);
-        if (!tool || typeof id !== 'string') continue;
+        // const tool = tools.find((t) => t.name === name);
+        // if (!tool || typeof id !== 'string') continue;
 
-        let parsedArgs: unknown = rawArgs;
-        if (typeof rawArgs === 'string') {
-          try {
-            parsedArgs = JSON.parse(rawArgs);
-          } catch {
-            parsedArgs = { query: rawArgs };
-          }
-        }
 
-        let toolInput: unknown = parsedArgs;
-        if (parsedArgs && typeof parsedArgs === 'object' && 'query' in (parsedArgs as any)) {
-          toolInput = (parsedArgs as any).query;
+        // console.log("toolInput", toolInput)
+        if (name == 'web_search') {
+          console.log('web_search',  call.args as any);
+          const result = await this.webSearchTool.invoke(call.args as any);
+          console.log('web_search result', result);
+          workingMessages.push(
+            new ToolMessage({
+              tool_call_id: id,
+              content:
+                typeof result === 'string' ? result : JSON.stringify(result),
+            }),
+          );
+        } else {
+          workingMessages.push(
+            new ToolMessage({
+              tool_call_id: id,
+              content: '工具不存在',
+            }),
+          );
         }
-        if (typeof toolInput !== 'string') {
-          toolInput = JSON.stringify(toolInput);
-        }
-
-        const result = await tool.invoke(toolInput as any);
-        workingMessages.push(
-          new ToolMessage({
-            tool_call_id: id,
-            content: typeof result === 'string' ? result : JSON.stringify(result),
-          }),
-        );
       }
     }
 
