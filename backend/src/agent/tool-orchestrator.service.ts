@@ -7,7 +7,6 @@ import {
 import { ChatOpenAI } from '@langchain/openai';
 import { DynamicTool } from '@langchain/core/tools';
 import { PLANNER_MODEL_TOKEN } from './llm.provider';
-import { WEB_SEARCH_TOOL_TOKEN } from './web-search-tool.provider';
 
 @Injectable()
 export class ToolOrchestratorService {
